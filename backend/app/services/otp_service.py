@@ -63,8 +63,30 @@ class OTPService:
             user = (await db.execute(stmt)).scalar_one_or_none()
 
         if user is None and (user_id == "latest" or (not user_id and not email)):
-            stmt = select(User).order_by(User.created_at.desc()).limit(1)
-            user = (await db.execute(stmt)).scalar_one_or_none()
+            # Prefer the most recent unverified/inactive candidate account awaiting 2FA completion
+            pending_stmt = (
+                select(User)
+                .where(
+                    User.is_active.is_(False),
+                    ~User.email.like("pg.test.%@skillverse.edu"),
+                )
+                .order_by(User.updated_at.desc(), User.created_at.desc())
+                .limit(1)
+            )
+            user = (await db.execute(pending_stmt)).scalar_one_or_none()
+
+            if user is None:
+                non_synth_stmt = (
+                    select(User)
+                    .where(~User.email.like("pg.test.%@skillverse.edu"))
+                    .order_by(User.updated_at.desc(), User.created_at.desc())
+                    .limit(1)
+                )
+                user = (await db.execute(non_synth_stmt)).scalar_one_or_none()
+
+            if user is None:
+                stmt = select(User).order_by(User.created_at.desc()).limit(1)
+                user = (await db.execute(stmt)).scalar_one_or_none()
 
         if not user:
             raise OTPChallengeError(

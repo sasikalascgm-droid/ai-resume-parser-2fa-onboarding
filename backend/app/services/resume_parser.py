@@ -311,12 +311,16 @@ class ResumeParserService:
                 page_texts: List[str] = []
                 total_images = 0
                 for page in pdf.pages:
-                    total_images += len(getattr(page, "images", []) or [])
+                    try:
+                        total_images += len(getattr(page, "images", []) or [])
+                    except Exception:
+                        pass
                     txt = page.extract_text() or ""
                     if txt.strip():
                         page_texts.append(txt.strip())
 
-                combined = "\n".join(page_texts).replace("\x00", "").strip()
+                combined = "\n".join(page_texts).replace("\x00", "")
+                combined = combined.encode("utf-8", "replace").decode("utf-8").strip()
                 if not combined:
                     if total_images > 0:
                         raise ResumeValidationError(
@@ -333,8 +337,8 @@ class ResumeParserService:
                 return combined, warnings
         except ResumeValidationError:
             raise
-        except Exception:
-            logger.warning("Failed to parse PDF file due to structural corruption.")
+        except Exception as exc:
+            logger.warning("Failed to parse PDF file due to structural corruption: %s", type(exc).__name__)
             raise ResumeValidationError(
                 "Unable to read PDF file. The file appears to be corrupted or password-protected.",
                 status_code=422,
@@ -354,7 +358,8 @@ class ResumeParserService:
                     if row_cells:
                         chunks.append(" | ".join(row_cells))
 
-            combined = "\n".join(chunks).replace("\x00", "").strip()
+            combined = "\n".join(chunks).replace("\x00", "")
+            combined = combined.encode("utf-8", "replace").decode("utf-8").strip()
             if not combined:
                 raise ResumeValidationError(
                     "The uploaded DOCX document contains no readable text.",
@@ -364,8 +369,8 @@ class ResumeParserService:
             return combined, warnings
         except ResumeValidationError:
             raise
-        except Exception:
-            logger.warning("Failed to parse DOCX file due to structural corruption.")
+        except Exception as exc:
+            logger.warning("Failed to parse DOCX file due to structural corruption: %s", type(exc).__name__)
             raise ResumeValidationError(
                 "Unable to read DOCX file. The file appears to be corrupted or invalid.",
                 status_code=422,
@@ -374,7 +379,10 @@ class ResumeParserService:
 
     def save_uploaded_file_safely(self, stored_filename: str, content: bytes) -> Path:
         settings = get_settings()
-        upload_dir = Path(settings.UPLOAD_DIR).resolve()
+        raw_upload_dir = Path(settings.UPLOAD_DIR)
+        if not raw_upload_dir.is_absolute():
+            raw_upload_dir = Path(__file__).resolve().parents[2] / raw_upload_dir
+        upload_dir = raw_upload_dir.resolve()
         upload_dir.mkdir(parents=True, exist_ok=True)
         safe_name = Path(stored_filename).name
         target_path = (upload_dir / safe_name).resolve()
@@ -389,7 +397,12 @@ class ResumeParserService:
 
     def parse_resume_bytes(self, content: bytes, extension: str) -> Tuple[str, ExtractedResumeData, List[str]]:
         raw_text, warnings = self.extract_text_from_bytes(content, extension)
-        extracted = self.extractor.extract(raw_text)
+        try:
+            extracted = self.extractor.extract(raw_text)
+        except Exception as exc:
+            logger.error("Failed to extract structured metadata from resume text: %s", type(exc).__name__, exc_info=True)
+            extracted = ExtractedResumeData()
+            warnings.append("Some structured candidate fields could not be automatically extracted.")
         return raw_text, extracted, warnings
 
 

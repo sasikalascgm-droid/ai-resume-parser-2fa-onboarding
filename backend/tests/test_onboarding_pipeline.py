@@ -731,3 +731,55 @@ async def test_resume_linking_synchronization_multiple_uploads_and_preview_secur
     )
     assert file_download.status_code == 200
     assert "attachment" in file_download.headers["content-disposition"]
+
+
+@pytest.mark.asyncio
+async def test_totp_drift_window_ntp_reference_and_replay_protection(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    user_id = await _register_test_user(client, "totp.drift@example.com", "9811223344")
+
+    setup_res = await client.post(
+        "/api/v1/auth/totp/setup",
+        json={"user_id": user_id},
+    )
+    assert setup_res.status_code == 200
+
+    user_db = (await db_session.execute(select(User).where(User.id == user_id))).scalar_one()
+    await db_session.refresh(user_db)
+    secret = decrypt_totp_secret(user_db.totp_secret_encrypted)
+    totp = pyotp.TOTP(secret)
+
+    # 1. Code outside valid_window (+90 seconds = +3 steps) must be rejected
+    far_future_code = totp.at(datetime.now(timezone.utc) + timedelta(seconds=90))
+    if far_future_code != totp.now():
+        bad_res = await client.post(
+            "/api/v1/auth/totp/verify",
+            json={"user_id": user_id, "otp": far_future_code},
+        )
+        assert bad_res.status_code == 400
+        assert bad_res.json()["error_code"] == "INVALID_TOTP"
+
+    # 2. Simulate 12-hour host clock skew relative to NTP (Google Authenticator on mobile uses NTP time)
+    simulated_ntp_time = datetime.now(timezone.utc) + timedelta(hours=12)
+    monkeypatch.setattr(
+        "app.services.totp_service._get_verification_reference_times",
+        lambda: [simulated_ntp_time, datetime.now(timezone.utc)],
+    )
+
+    # Code from mobile Google Authenticator at NTP time (-30s drift step) must be accepted
+    mobile_code = totp.at(simulated_ntp_time - timedelta(seconds=30))
+    ok_res = await client.post(
+        "/api/v1/auth/totp/verify",
+        json={"user_id": user_id, "otp": mobile_code},
+    )
+    assert ok_res.status_code == 200
+    assert ok_res.json()["is_totp_enabled"] is True
+
+    # 3. Replaying the exact same TOTP code within the 90s window must be rejected
+    replay_res = await client.post(
+        "/api/v1/auth/totp/verify",
+        json={"user_id": user_id, "otp": mobile_code},
+    )
+    assert replay_res.status_code == 400
+    assert replay_res.json()["error_code"] == "OTP_REPLAY_DETECTED"

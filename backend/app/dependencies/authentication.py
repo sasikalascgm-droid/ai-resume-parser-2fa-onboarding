@@ -67,7 +67,13 @@ async def get_optional_current_user(
             return None
         stmt = select(User).where(User.id == str(user_id))
         return (await db.execute(stmt)).scalar_one_or_none()
+    except TokenAuthError:
+        return None
     except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
         return None
 
 

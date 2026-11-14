@@ -208,7 +208,13 @@ async def pydantic_validation_exception_handler(request: Request, exc: RequestVa
 
 @app.exception_handler(SQLAlchemyError)
 async def database_exception_handler(request: Request, exc: SQLAlchemyError):
-    logger.error("Database operation error: %s", type(exc).__name__)
+    logger.error(
+        "Database operation error on %s %s: %s",
+        request.method,
+        request.url.path,
+        type(exc).__name__,
+        exc_info=True,
+    )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
@@ -221,7 +227,13 @@ async def database_exception_handler(request: Request, exc: SQLAlchemyError):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    logger.error("Unhandled server error: %s", type(exc).__name__)
+    logger.error(
+        "Unhandled server error on %s %s: %s",
+        request.method,
+        request.url.path,
+        type(exc).__name__,
+        exc_info=True,
+    )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={

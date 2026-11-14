@@ -33,7 +33,7 @@ interface OnboardingContextValue {
   ) => void;
   setStagedUser: React.Dispatch<React.SetStateAction<StagedUserState | null>>;
   setAuthenticatedToken: (token: string | null) => void;
-  refreshProfile: () => Promise<ProfileData | null>;
+  refreshProfile: (overrideResumeId?: string) => Promise<ProfileData | null>;
   logoutSession: () => Promise<void>;
 }
 
@@ -132,12 +132,16 @@ export const OnboardingProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     setAccessToken(token);
   };
 
-  const refreshProfile = async (): Promise<ProfileData | null> => {
+  const refreshProfile = async (overrideResumeId?: string): Promise<ProfileData | null> => {
     try {
       let profile = await onboardingApi.getProfile();
-      if (resumeId && (!profile.latest_resume || profile.latest_resume.id !== resumeId)) {
+      const targetResumeId = overrideResumeId ?? resumeId;
+      if (
+        targetResumeId &&
+        (!profile.latest_resume || profile.latest_resume.id !== targetResumeId)
+      ) {
         try {
-          await onboardingApi.associateResume(resumeId);
+          await onboardingApi.associateResume(targetResumeId);
           profile = await onboardingApi.getProfile();
         } catch {
           // Ignore if resume belongs to another user or was not found

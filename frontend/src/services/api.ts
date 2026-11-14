@@ -54,14 +54,27 @@ export function extractApiErrorMessage(error: unknown): string {
       errors?: Array<{ field: string; message: string }>;
     }>;
     const data = axiosErr.response?.data;
-    if (data?.errors && data.errors.length > 0) {
-      return data.errors.map((e) => e.message).join(' ');
+    if (data && typeof data === 'object') {
+      if (Array.isArray(data.errors) && data.errors.length > 0) {
+        return data.errors.map((e) => e.message).join(' ');
+      }
+      if (typeof data.message === 'string' && data.message.trim()) {
+        return data.message;
+      }
+      if (typeof data.detail === 'string' && data.detail.trim()) {
+        return data.detail;
+      }
     }
-    if (data?.message) {
-      return data.message;
+    const status = axiosErr.response?.status;
+    if (status === 500 || status === 502 || status === 503 || status === 504) {
+      return (
+        'Unable to reach the resume parsing backend service (HTTP ' +
+        status +
+        '). Please ensure the FastAPI backend server is running on http://127.0.0.1:8000 and try again.'
+      );
     }
-    if (typeof data?.detail === 'string') {
-      return data.detail;
+    if (!axiosErr.response && axiosErr.code === 'ERR_NETWORK') {
+      return 'Network error: Unable to connect to the backend API server (http://127.0.0.1:8000).';
     }
   }
   if (error instanceof Error) {

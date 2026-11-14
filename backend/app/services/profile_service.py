@@ -56,7 +56,7 @@ class ProfileService:
 
         raw_name = metadata.get("full_name")
         if isinstance(raw_name, str):
-            clean_name = " ".join(raw_name.strip().split())
+            clean_name = " ".join(raw_name.replace("\x00", "").strip().split())[:255]
             if len(clean_name) >= 2 and user.full_name != clean_name:
                 user.full_name = clean_name
                 updated = True
@@ -67,7 +67,7 @@ class ProfileService:
             cleaned_skills = []
             for item in raw_skills:
                 if isinstance(item, str):
-                    s = item.strip()
+                    s = item.replace("\x00", "").strip()[:100]
                     if s and s.lower() not in seen:
                         seen.add(s.lower())
                         cleaned_skills.append(s)
@@ -77,14 +77,14 @@ class ProfileService:
 
         raw_exp = metadata.get("experience")
         if isinstance(raw_exp, str):
-            clean_exp = raw_exp.strip()
+            clean_exp = raw_exp.replace("\x00", "").strip()[:2000]
             if clean_exp and user.experience != clean_exp:
                 user.experience = clean_exp
                 updated = True
 
         raw_qual = metadata.get("qualification")
         if isinstance(raw_qual, str):
-            clean_qual = raw_qual.strip()
+            clean_qual = raw_qual.replace("\x00", "").strip()[:255]
             if clean_qual and user.qualification != clean_qual:
                 user.qualification = clean_qual
                 updated = True

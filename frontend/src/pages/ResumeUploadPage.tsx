@@ -90,7 +90,7 @@ export const ResumeUploadPage: React.FC = () => {
         response.extracted_data
       );
       if (accessToken || currentUserProfile) {
-        await refreshProfile();
+        await refreshProfile(response.resume_id);
       }
       setParsingStatus('success');
     } catch (err) {

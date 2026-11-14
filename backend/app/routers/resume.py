@@ -68,13 +68,15 @@ async def parse_resume_endpoint(
             and latest_existing.extracted_text == raw_text
             and _resolve_stored_resume_path(latest_existing.stored_filename) is not None
         ):
+            existing_id = latest_existing.id
+            existing_filename = latest_existing.original_filename
             if profile_service.sync_profile_from_resume_metadata(current_user, metadata_dict):
                 await db.commit()
                 await db.refresh(current_user)
             return ResumeParseResponse(
                 success=True,
-                resume_id=latest_existing.id,
-                original_filename=latest_existing.original_filename,
+                resume_id=existing_id,
+                original_filename=existing_filename,
                 extracted_data=extracted_data,
                 warnings=warnings,
             )
