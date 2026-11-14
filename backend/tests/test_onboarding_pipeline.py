@@ -14,7 +14,11 @@ from app.core.security import (
 from app.models.otp_challenge import OTPChallenge
 from app.models.user import User
 from app.models.user_resume import UserResume
-from tests.conftest import create_sample_docx_bytes, create_sample_pdf_bytes
+from tests.conftest import (
+    create_sample_docx_bytes,
+    create_sample_pdf_bytes,
+    create_scanned_pdf_bytes_from_pages,
+)
 
 
 # ============================================================================
@@ -783,3 +787,138 @@ async def test_totp_drift_window_ntp_reference_and_replay_protection(
     )
     assert replay_res.status_code == 400
     assert replay_res.json()["error_code"] == "OTP_REPLAY_DETECTED"
+
+
+@pytest.mark.asyncio
+async def test_scanned_pdf_single_page_ocr_extraction(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+):
+    import pdfplumber
+    import io as _io
+    from app.services.resume_parser import _resolve_tesseract_executable
+
+    page_lines = [
+        "Rohan Kulkarni",
+        "Email: rohan.kulkarni@example.com",
+        "Phone: +91 9876501234",
+        "Qualification: M.Tech in Computer Science",
+        "Experience: 5 years of experience",
+        "Skills: Python, FastAPI, PostgreSQL, Docker, React",
+    ]
+    scanned_pdf_bytes = create_scanned_pdf_bytes_from_pages([page_lines])
+
+    # Confirm the generated PDF is genuinely image-only (zero machine-readable text in pdfplumber)
+    with pdfplumber.open(_io.BytesIO(scanned_pdf_bytes)) as pdf:
+        assert len(pdf.pages) == 1
+        assert (pdf.pages[0].extract_text() or "").strip() == ""
+
+    # If Tesseract binary is not installed in the test environment, mock image_to_string deterministically
+    if _resolve_tesseract_executable() is None:
+        monkeypatch.setattr(
+            "pytesseract.image_to_string",
+            lambda img, **kwargs: "\n".join(page_lines),
+        )
+
+    res = await client.post(
+        "/api/v1/resume/parse",
+        files={"file": ("rohan_scanned_cv.pdf", scanned_pdf_bytes, "application/pdf")},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["success"] is True
+    assert any("OCR" in w for w in body["warnings"])
+    ext = body["extracted_data"]
+    assert ext["full_name"] == "Rohan Kulkarni"
+    assert ext["email"] == "rohan.kulkarni@example.com"
+    assert "9876501234" in ext["phone"]
+    assert "M.Tech" in ext["qualification"]
+    assert "5 years" in ext["experience"]
+    assert "Python" in ext["skills"]
+    assert "FastAPI" in ext["skills"]
+    assert "PostgreSQL" in ext["skills"]
+
+
+@pytest.mark.asyncio
+async def test_scanned_pdf_multipage_ocr_extraction_and_page_limit(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+):
+    from app.core.config import get_settings
+    from app.services.resume_parser import _resolve_tesseract_executable
+
+    page1_lines = [
+        "Ananya Deshpande",
+        "Email: ananya.d@example.com",
+        "Phone: 9823456789",
+        "Qualification: B.Tech in Information Technology",
+    ]
+    page2_lines = [
+        "Professional Summary",
+        "Experience: 4 years",
+        "Skills: TypeScript, React, Node.js, PostgreSQL, AWS",
+    ]
+    page3_lines = [
+        "Additional Appendix Page",
+        "Skills: Kubernetes",
+    ]
+    multipage_scanned_bytes = create_scanned_pdf_bytes_from_pages(
+        [page1_lines, page2_lines, page3_lines]
+    )
+
+    if _resolve_tesseract_executable() is None:
+        call_idx = {"n": 0}
+        pages_data = [page1_lines, page2_lines, page3_lines]
+
+        def _fake_ocr(img, **kwargs):
+            i = call_idx["n"]
+            call_idx["n"] += 1
+            return "\n".join(pages_data[min(i, len(pages_data) - 1)])
+
+        monkeypatch.setattr("pytesseract.image_to_string", _fake_ocr)
+
+    # Set OCR_MAX_PAGES=2 to verify multi-page aggregation (pages 1 & 2) and page limit warning
+    settings = get_settings()
+    monkeypatch.setattr(settings, "OCR_MAX_PAGES", 2)
+
+    res = await client.post(
+        "/api/v1/resume/parse",
+        files={"file": ("ananya_multipage_scan.pdf", multipage_scanned_bytes, "application/pdf")},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["success"] is True
+    assert any("limited to the first 2 pages" in w for w in body["warnings"])
+    ext = body["extracted_data"]
+    assert ext["full_name"] == "Ananya Deshpande"
+    assert ext["email"] == "ananya.d@example.com"
+    assert "9823456789" in ext["phone"]
+    assert "B.Tech" in ext["qualification"]
+    assert "4 years" in ext["experience"]
+    assert "TypeScript" in ext["skills"]
+    assert "React" in ext["skills"]
+    assert "PostgreSQL" in ext["skills"]
+
+
+@pytest.mark.asyncio
+async def test_scanned_pdf_ocr_unavailable_returns_actionable_error(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+):
+    import pytesseract
+
+    scanned_bytes = create_scanned_pdf_bytes_from_pages(
+        [["Candidate Name", "Email: candidate@example.com"]]
+    )
+
+    def _raise_not_found(*args, **kwargs):
+        raise pytesseract.TesseractNotFoundError()
+
+    monkeypatch.setattr("pytesseract.image_to_string", _raise_not_found)
+
+    res = await client.post(
+        "/api/v1/resume/parse",
+        files={"file": ("missing_ocr_scan.pdf", scanned_bytes, "application/pdf")},
+    )
+    assert res.status_code == 422
+    data = res.json()
+    assert data["success"] is False
+    assert data["error_code"] == "OCR_UNAVAILABLE"
+    assert "Tesseract OCR" in data["message"]

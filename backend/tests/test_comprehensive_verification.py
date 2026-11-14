@@ -245,7 +245,7 @@ async def test_scanned_pdf_detection_and_security_controls(client: AsyncClient):
     assert response.status_code == 422
     data = response.json()
     assert data["success"] is False
-    assert data["error_code"] == "SCANNED_PDF_NEEDS_OCR"
+    assert data["error_code"] in {"SCANNED_PDF_NEEDS_OCR", "OCR_UNAVAILABLE"}
 
     # Path traversal sanitization check
     safe_name = sanitize_original_filename("../../etc/shadow/../../candidate_cv.pdf")

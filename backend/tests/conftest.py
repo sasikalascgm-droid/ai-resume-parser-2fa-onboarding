@@ -2,10 +2,12 @@ import io
 from typing import AsyncGenerator, List
 
 import docx
+import pymupdf
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from reportlab.lib.pagesizes import letter
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -28,6 +30,37 @@ def create_sample_pdf_bytes(lines: List[str]) -> bytes:
     c.showPage()
     c.save()
     return buffer.getvalue()
+
+
+def create_scanned_pdf_bytes_from_pages(pages_lines: List[List[str]]) -> bytes:
+    """
+    Create a genuine scanned/image-only multi-page PDF document in memory:
+    1. Renders each page's text to a temporary vector PDF,
+    2. Rasterizes each page to a PNG image via PyMuPDF (200 DPI),
+    3. Embeds ONLY the raster PNG images into a new PDF (zero PDF text streams).
+    """
+    vector_buf = io.BytesIO()
+    vc = canvas.Canvas(vector_buf, pagesize=letter)
+    vc.setFont("Helvetica", 14)
+    for page_lines in pages_lines:
+        y = 730
+        for line in page_lines:
+            vc.drawString(60, y, line)
+            y -= 26
+        vc.showPage()
+    vc.save()
+
+    scanned_buf = io.BytesIO()
+    sc = canvas.Canvas(scanned_buf, pagesize=letter)
+    with pymupdf.open(stream=vector_buf.getvalue(), filetype="pdf") as doc:
+        for mpage in doc:
+            pix = mpage.get_pixmap(dpi=200, alpha=False)
+            png_bytes = pix.tobytes("png")
+            img_reader = ImageReader(io.BytesIO(png_bytes))
+            sc.drawImage(img_reader, 0, 0, width=letter[0], height=letter[1])
+            sc.showPage()
+    sc.save()
+    return scanned_buf.getvalue()
 
 
 def create_sample_docx_bytes(lines: List[str]) -> bytes:

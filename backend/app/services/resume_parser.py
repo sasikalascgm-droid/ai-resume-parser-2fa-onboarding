@@ -1,16 +1,69 @@
 import io
+import os
 import re
+import shutil
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import docx
 import pdfplumber
+import pymupdf
+import pytesseract
+from PIL import Image
 
 from app.core.config import get_settings
 from app.core.logging import logger
 from app.schemas.resume import ExtractedResumeData
 from app.utils.file_validation import ResumeValidationError
+
+_WINDOWS_TESSERACT_CANDIDATES: Tuple[str, ...] = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe",
+    r"%LOCALAPPDATA%\Tesseract-OCR\tesseract.exe",
+    r"%USERPROFILE%\scoop\apps\tesseract\current\tesseract.exe",
+    r"C:\ProgramData\chocolatey\bin\tesseract.exe",
+)
+
+
+def _resolve_tesseract_executable() -> Optional[str]:
+    """
+    Locate the local Tesseract OCR executable from settings, environment variables,
+    system PATH, or standard Windows installation directories.
+    """
+    settings = get_settings()
+    candidates: List[str] = []
+
+    if getattr(settings, "TESSERACT_CMD", ""):
+        candidates.append(settings.TESSERACT_CMD.strip())
+
+    env_cmd = os.environ.get("TESSERACT_CMD", "").strip()
+    if env_cmd:
+        candidates.append(env_cmd)
+
+    which_cmd = shutil.which("tesseract")
+    if which_cmd:
+        candidates.append(which_cmd)
+
+    current_pytesseract_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", "")
+    if current_pytesseract_cmd and current_pytesseract_cmd != "tesseract":
+        candidates.append(current_pytesseract_cmd)
+
+    for raw_win_path in _WINDOWS_TESSERACT_CANDIDATES:
+        expanded = os.path.expandvars(raw_win_path)
+        candidates.append(expanded)
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        resolved = shutil.which(candidate) if not os.path.isabs(candidate) else candidate
+        if resolved and os.path.isfile(resolved):
+            pytesseract.pytesseract.tesseract_cmd = resolved
+            return resolved
+
+    return None
 
 # Curated canonical skills dictionary for deterministic, zero-hallucination matching
 KNOWN_SKILLS_MAP = {
@@ -302,39 +355,65 @@ class ResumeParserService:
     def _extract_pdf_text(self, content: bytes, warnings: List[str]) -> Tuple[str, List[str]]:
         try:
             with pdfplumber.open(io.BytesIO(content)) as pdf:
-                if len(pdf.pages) == 0:
+                total_pages = len(pdf.pages)
+                if total_pages == 0:
                     raise ResumeValidationError(
                         "The uploaded PDF contains no pages.",
                         status_code=422,
                         error_code="EMPTY_DOCUMENT",
                     )
-                page_texts: List[str] = []
+                page_texts_by_idx: Dict[int, str] = {}
                 total_images = 0
-                for page in pdf.pages:
+                for idx, page in enumerate(pdf.pages):
                     try:
                         total_images += len(getattr(page, "images", []) or [])
                     except Exception:
                         pass
-                    txt = page.extract_text() or ""
-                    if txt.strip():
-                        page_texts.append(txt.strip())
+                    txt = (page.extract_text() or "").replace("\x00", "").strip()
+                    if txt:
+                        page_texts_by_idx[idx] = txt
 
-                combined = "\n".join(page_texts).replace("\x00", "")
-                combined = combined.encode("utf-8", "replace").decode("utf-8").strip()
-                if not combined:
-                    if total_images > 0:
-                        raise ResumeValidationError(
-                            "Scanned PDF detected: no machine-readable text could be extracted. "
-                            "Please upload a text-based PDF/DOCX or run OCR on your document first.",
-                            status_code=422,
-                            error_code="SCANNED_PDF_NEEDS_OCR",
-                        )
+                # Fast path: all pages yielded machine-readable text
+                if len(page_texts_by_idx) == total_pages:
+                    combined = "\n".join(
+                        page_texts_by_idx[i] for i in range(total_pages)
+                    )
+                    combined = combined.encode("utf-8", "replace").decode("utf-8").strip()
+                    if combined:
+                        return combined, warnings
+
+                # Inspect pages lacking text with PyMuPDF to determine if they contain scanned images
+                has_visual_content = total_images > 0
+                if not has_visual_content:
+                    with pymupdf.open(stream=content, filetype="pdf") as mupdf_doc:
+                        for mpage in mupdf_doc:
+                            if len(mpage.get_images(full=True)) > 0:
+                                has_visual_content = True
+                                break
+
+                # If some pages had text and there are no scanned images on the remaining pages, return text
+                if page_texts_by_idx and not has_visual_content:
+                    combined = "\n".join(
+                        page_texts_by_idx[i] for i in sorted(page_texts_by_idx.keys())
+                    )
+                    combined = combined.encode("utf-8", "replace").decode("utf-8").strip()
+                    if combined:
+                        return combined, warnings
+
+                # If no pages had text and no pages contain any images, the PDF is blank
+                if not page_texts_by_idx and not has_visual_content:
                     raise ResumeValidationError(
                         "No readable text found in the PDF. If this is a scanned PDF, OCR is required.",
                         status_code=422,
                         error_code="EMPTY_OR_SCANNED_PDF",
                     )
-                return combined, warnings
+
+                # Scanned or hybrid PDF detected -> run local OCR on pages missing text
+                return self._extract_pdf_text_via_ocr(
+                    content=content,
+                    warnings=warnings,
+                    existing_page_texts=page_texts_by_idx,
+                )
         except ResumeValidationError:
             raise
         except Exception as exc:
@@ -344,6 +423,126 @@ class ResumeParserService:
                 status_code=422,
                 error_code="CORRUPTED_FILE",
             )
+
+    def _extract_pdf_text_via_ocr(
+        self,
+        content: bytes,
+        warnings: List[str],
+        existing_page_texts: Optional[Dict[int, str]] = None,
+    ) -> Tuple[str, List[str]]:
+        """
+        Render scanned PDF pages to grayscale images using PyMuPDF and extract text
+        locally using Tesseract OCR (pytesseract), enforcing page, resolution, and timeout limits.
+        """
+        settings = get_settings()
+        if len(content) > settings.max_upload_bytes:
+            raise ResumeValidationError(
+                f"File size exceeds the maximum allowed limit of {settings.MAX_UPLOAD_SIZE_MB} MB.",
+                status_code=413,
+                error_code="FILE_TOO_LARGE",
+            )
+
+        max_pages = max(1, int(getattr(settings, "OCR_MAX_PAGES", 10)))
+        dpi = min(max(72, int(getattr(settings, "OCR_RENDER_DPI", 200))), 300)
+        max_dim = max(500, int(getattr(settings, "OCR_MAX_IMAGE_DIMENSION", 2500)))
+        page_timeout = max(2, int(getattr(settings, "OCR_PAGE_TIMEOUT_SECONDS", 15)))
+        total_timeout = max(5, int(getattr(settings, "OCR_TOTAL_TIMEOUT_SECONDS", 60)))
+
+        _resolve_tesseract_executable()
+
+        existing_map = existing_page_texts or {}
+        collected_pages: List[str] = []
+        start_mono = time.monotonic()
+
+        with pymupdf.open(stream=content, filetype="pdf") as doc:
+            total_pages = len(doc)
+            if total_pages == 0:
+                raise ResumeValidationError(
+                    "The uploaded PDF contains no pages.",
+                    status_code=422,
+                    error_code="EMPTY_DOCUMENT",
+                )
+
+            pages_to_process = min(total_pages, max_pages)
+            if total_pages > max_pages:
+                warnings.append(
+                    f"PDF has {total_pages} pages; OCR was limited to the first {max_pages} pages."
+                )
+
+            for idx in range(pages_to_process):
+                if idx in existing_map and existing_map[idx].strip():
+                    collected_pages.append(existing_map[idx].strip())
+                    continue
+
+                elapsed = time.monotonic() - start_mono
+                if elapsed > total_timeout:
+                    if collected_pages:
+                        warnings.append(
+                            f"OCR time limit ({total_timeout}s) reached after {idx} page(s); returning partial text."
+                        )
+                        break
+                    raise ResumeValidationError(
+                        f"OCR processing exceeded the {total_timeout}-second time limit. "
+                        "Please upload a smaller or clearer resume PDF.",
+                        status_code=422,
+                        error_code="OCR_TIMEOUT",
+                    )
+
+                mpage = doc[idx]
+                pix = mpage.get_pixmap(dpi=dpi, alpha=False)
+                pil_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples).convert("L")
+
+                if max(pil_img.width, pil_img.height) > max_dim:
+                    pil_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+
+                try:
+                    ocr_text = (
+                        pytesseract.image_to_string(
+                            pil_img,
+                            lang="eng",
+                            timeout=page_timeout,
+                        )
+                        or ""
+                    )
+                except pytesseract.TesseractNotFoundError:
+                    raise ResumeValidationError(
+                        "Scanned PDF detected, but Tesseract OCR is not installed or could not be found on the server. "
+                        "Please install Tesseract OCR (e.g., 'winget install --id UB-Mannheim.TesseractOCR -e' on Windows) "
+                        "or set TESSERACT_CMD in .env to the full path of tesseract.exe.",
+                        status_code=422,
+                        error_code="OCR_UNAVAILABLE",
+                    )
+                except RuntimeError:
+                    raise ResumeValidationError(
+                        f"OCR timed out while processing page {idx + 1} (limit: {page_timeout}s). "
+                        "Please upload a clearer or smaller PDF resume.",
+                        status_code=422,
+                        error_code="OCR_TIMEOUT",
+                    )
+                except Exception as exc:
+                    logger.warning("OCR failed on page %d: %s", idx + 1, type(exc).__name__)
+                    raise ResumeValidationError(
+                        "Scanned PDF detected, but OCR processing failed. Please ensure Tesseract OCR is properly installed.",
+                        status_code=422,
+                        error_code="OCR_PROCESSING_ERROR",
+                    )
+
+                cleaned_page = ocr_text.replace("\x00", "").strip()
+                if cleaned_page:
+                    collected_pages.append(cleaned_page)
+
+        combined = "\n".join(collected_pages).replace("\x00", "")
+        combined = combined.encode("utf-8", "replace").decode("utf-8").strip()
+        if not combined:
+            raise ResumeValidationError(
+                "Scanned PDF detected: no machine-readable text could be extracted even after running OCR. "
+                "Please upload a clearer scan or a text-based PDF/DOCX.",
+                status_code=422,
+                error_code="SCANNED_PDF_NEEDS_OCR",
+            )
+
+        warnings.append("Scanned PDF processed using local Tesseract OCR.")
+        return combined, warnings
 
     def _extract_docx_text(self, content: bytes, warnings: List[str]) -> Tuple[str, List[str]]:
         try:

@@ -136,6 +136,14 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE_MB: int = 5
     UPLOAD_DIR: str = str(BASE_DIR / "uploads")
 
+    # OCR Configuration & Resource Limits (Tesseract + PyMuPDF)
+    TESSERACT_CMD: str = ""
+    OCR_MAX_PAGES: int = 10
+    OCR_RENDER_DPI: int = 200
+    OCR_MAX_IMAGE_DIMENSION: int = 2500
+    OCR_PAGE_TIMEOUT_SECONDS: int = 15
+    OCR_TOTAL_TIMEOUT_SECONDS: int = 60
+
     model_config = SettingsConfigDict(
         env_file=(str(BASE_DIR.parent / ".env"), str(BASE_DIR / ".env")),
         env_file_encoding="utf-8",

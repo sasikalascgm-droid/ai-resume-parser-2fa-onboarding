@@ -13,6 +13,7 @@ import {
 } from '../types/onboarding';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api/v1';
+const DIRECT_BACKEND_API_URL = 'http://127.0.0.1:8000/api/v1';
 const TOKEN_STORAGE_KEY = 'edtech_jwt_token';
 
 export const apiClient = axios.create({
@@ -33,6 +34,29 @@ apiClient.interceptors.request.use((config) => {
   }
   return config;
 });
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    if (axios.isAxiosError(error) && error.config) {
+      const cfg = error.config as typeof error.config & { _retriedDirectBackend?: boolean };
+      const status = error.response?.status;
+      const isProxyOrNetworkFailure =
+        !error.response || status === 502 || status === 503 || status === 504;
+
+      if (
+        !cfg._retriedDirectBackend &&
+        isProxyOrNetworkFailure &&
+        cfg.baseURL !== DIRECT_BACKEND_API_URL
+      ) {
+        cfg._retriedDirectBackend = true;
+        cfg.baseURL = DIRECT_BACKEND_API_URL;
+        return apiClient.request(cfg);
+      }
+    }
+    return Promise.reject(error);
+  }
+);
 
 export function setStoredAccessToken(token: string | null): void {
   if (token) {
